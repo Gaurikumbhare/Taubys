@@ -93,7 +93,7 @@ export default function AboutPage() {
                 {/* TOP ROW: 3 vertical photos */}
                 <div className="flex-1 grid grid-cols-3 gap-3 lg:gap-4">
                   <div className="relative rounded-3xl overflow-hidden shadow-sm group">
-                    <Image src="/about-collage-2.jpg" alt="Store Front" fill className="object-cover transition-transform duration-700 group-hover:scale-105" />
+                    <Image src="/about-collage-2-new.jpg" alt="Store Front" fill className="object-cover transition-transform duration-700 group-hover:scale-105" />
                   </div>
                   <div className="relative rounded-3xl overflow-hidden shadow-sm group">
                     <Image src="/about-collage-4.jpg" alt="Military Visit" fill className="object-cover transition-transform duration-700 group-hover:scale-105" />

@@ -1,0 +1,493 @@
+"use client";
+
+import React, { useState } from "react";
+import Image from "next/image";
+import { useCart } from "@/store/useCart";
+import { MapPin, Truck, CreditCard, ChevronRight, CheckCircle2 } from "lucide-react";
+import { cn } from "@/lib/utils";
+import Link from "next/link";
+import { toast } from "react-hot-toast";
+import Script from "next/script";
+import { createRazorpayOrder, verifyRazorpayPayment } from "@/actions/payment";
+import { DELIVERY_CHARGE } from "@/constants";
+import { motion } from "framer-motion";
+import { formatPrice } from "@/lib/utils";
+import { supabase } from "@/lib/supabase";
+import { useRouter } from "next/navigation";
+
+interface RazorpayResponse {
+  razorpay_order_id: string;
+  razorpay_payment_id: string;
+  razorpay_signature: string;
+}
+
+interface RazorpayErrorResponse {
+  error: { description: string };
+}
+
+declare global {
+  interface Window {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    Razorpay: any; 
+  }
+}
+
+export default function CheckoutPage() {
+  const { items, getTotalPrice, clearCart } = useCart();
+  const [mounted, setMounted] = useState(false);
+  const [step, setStep] = useState(1);
+  const [orderId, setOrderId] = useState("");
+  const [confirmedOrder, setConfirmedOrder] = useState<any>(null);
+  const [paymentMethod, setPaymentMethod] = useState<"razorpay" | "cod">("razorpay");
+  const [formData, setFormData] = useState({
+    name: "",
+    phone: "",
+    email: "",
+    address: "",
+    pincode: "",
+    city: "Nagpur",
+  });
+  const [isProcessing, setIsProcessing] = useState(false);
+  const router = useRouter();
+
+  React.useEffect(() => {
+    setMounted(true);
+    
+    // Check auth status
+    const checkAuth = async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        toast.error("Please login to continue to checkout");
+        router.push("/login?redirect=/checkout");
+        return;
+      }
+      
+      // Pre-fill form data if available from profile
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', session.user.id)
+        .single();
+        
+      if (profile) {
+        setFormData(prev => ({
+          ...prev,
+          name: profile.full_name || "",
+          email: profile.email || session.user.email || "",
+          phone: profile.phone || "",
+        }));
+      } else {
+        setFormData(prev => ({
+          ...prev,
+          email: session.user.email || "",
+        }));
+      }
+    };
+    
+    checkAuth();
+  }, [router]);
+
+  const subtotal = getTotalPrice();
+  const deliveryCharge = DELIVERY_CHARGE;
+  const total = subtotal + deliveryCharge;
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+    const { name, value } = e.target;
+    setFormData((prev) => ({ ...prev, [name]: value }));
+  };
+
+  const handlePayment = async () => {
+    if (paymentMethod === "cod") {
+      setIsProcessing(true);
+      const loadingToast = toast.loading("Placing your order...");
+      try {
+        // Simulate API call for saving order (can be updated to actual DB call later)
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        toast.success("Order placed successfully!", { id: loadingToast });
+        const newOrderId = `TB-${Date.now().toString().slice(-6)}`;
+        setOrderId(newOrderId);
+        setConfirmedOrder({
+          orderId: newOrderId,
+          date: new Date().toLocaleDateString('en-US', { month: 'long', day: '2-digit', year: 'numeric' }),
+          items: [...items],
+          subtotal: getTotalPrice(),
+          total: getTotalPrice() + deliveryCharge,
+          customerName: formData.name,
+          paymentMethod: 'Cash on Delivery'
+        });
+        setStep(3);
+        clearCart();
+      } catch (error) {
+        toast.error("Failed to place order. Please try again.", { id: loadingToast });
+      } finally {
+        setIsProcessing(false);
+      }
+      return;
+    }
+
+    if (!window.Razorpay) {
+      toast.error("Payment system is currently unavailable. Please try again later.");
+      return;
+    }
+
+    setIsProcessing(true);
+    const loadingToast = toast.loading("Initializing payment...");
+
+    try {
+      // 1. Create order on server
+      const { success, order, error } = await createRazorpayOrder(total);
+
+      if (!success || !order) {
+        throw new Error(error || "Failed to create order");
+      }
+
+      // 2. Initialize Razorpay Checkout
+      const options = {
+        key: process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID, // Use public key here if you have one, or configure proxy
+        amount: order.amount,
+        currency: order.currency,
+        name: "Tauby's Bakery",
+        description: "Order Payment",
+        image: "https://taubys.com/favicon.ico", // Replace with actual logo URL if available
+        order_id: order.id,
+        handler: async function (response: RazorpayResponse) {
+          toast.loading("Verifying payment...", { id: loadingToast });
+          
+          // 3. Verify payment on server and SAVE ORDER
+          const verifyResult = await verifyRazorpayPayment(
+            response.razorpay_order_id,
+            response.razorpay_payment_id,
+            response.razorpay_signature,
+            {
+              items: items,
+              total: total,
+              address: formData.address,
+              pincode: formData.pincode,
+              deliveryDate: items[0]?.deliveryDate || new Date().toISOString(),
+              deliverySlot: items[0]?.deliverySlot || "Standard",
+            }
+          );
+
+          if (verifyResult.success) {
+            toast.success("Payment successful! Order placed.", { id: loadingToast });
+            const newOrderId = verifyResult.orderId || `TB-${Date.now().toString().slice(-6)}`;
+            setOrderId(newOrderId);
+            setConfirmedOrder({
+              orderId: newOrderId,
+              date: new Date().toLocaleDateString('en-US', { month: 'long', day: '2-digit', year: 'numeric' }),
+              items: [...items],
+              subtotal: getTotalPrice(),
+              total: getTotalPrice() + deliveryCharge,
+              customerName: formData.name,
+              paymentMethod: 'Credit Card/Debit Card/NetBanking'
+            });
+            setStep(3);
+            clearCart();
+          } else {
+            toast.error(verifyResult.error || "Payment verification failed. Please contact support.", { id: loadingToast });
+          }
+        },
+        prefill: {
+          name: formData.name,
+          email: formData.email,
+          contact: formData.phone,
+        },
+        theme: {
+          color: "#3E2723", // Chocolate Brown
+        },
+      };
+
+      const rzp = new window.Razorpay(options);
+      rzp.on('payment.failed', function (response: RazorpayErrorResponse) {
+        toast.error(`Payment failed: ${response.error.description}`);
+      });
+      
+      toast.dismiss(loadingToast);
+      rzp.open();
+
+    } catch (error: unknown) {
+      console.error("Checkout error:", error);
+      const errorMessage = error instanceof Error ? error.message : "An error occurred during checkout";
+      toast.error(errorMessage, { id: loadingToast });
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  if (!mounted) {
+    return (
+      <div className="pt-32 pb-24 bg-cream/30 min-h-screen">
+        <div className="container mx-auto px-6 max-w-6xl animate-pulse">
+          <div className="h-8 w-64 bg-dark/10 rounded-full mx-auto mb-12" />
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-12">
+            <div className="lg:col-span-2 h-[600px] bg-white rounded-3xl" />
+            <div className="h-[400px] bg-white rounded-3xl" />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (items.length === 0 && step !== 3) {
+    return (
+      <div className="pt-40 pb-24 text-center min-h-[60vh] flex flex-col items-center justify-center">
+        <h2 className="text-3xl font-heading font-bold text-dark mb-4">Your bag is empty</h2>
+        <Link href="/menu" className="btn-primary">Return to Menu</Link>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <Script src="https://checkout.razorpay.com/v1/checkout.js" />
+      <div className="pt-32 pb-24 bg-cream/30 min-h-screen">
+        <div className="container mx-auto px-6 max-w-6xl">
+          {/* Checkout Progress */}
+          <div className="flex items-center justify-center mb-12 gap-4">
+            <div className={cn("flex items-center gap-2", step >= 1 ? "text-dark" : "text-dark/20")}>
+              <span className={cn("w-8 h-8 rounded-full flex items-center justify-center font-bold", step >= 1 ? "bg-dark text-cream" : "bg-dark/10")}>1</span>
+              <span className="font-bold hidden sm:block">Delivery</span>
+            </div>
+            <ChevronRight size={20} className="text-dark/20" />
+            <div className={cn("flex items-center gap-2", step >= 2 ? "text-dark" : "text-dark/20")}>
+              <span className={cn("w-8 h-8 rounded-full flex items-center justify-center font-bold", step >= 2 ? "bg-dark text-cream" : "bg-dark/10")}>2</span>
+              <span className="font-bold hidden sm:block">Payment</span>
+            </div>
+            <ChevronRight size={20} className="text-dark/20" />
+            <div className={cn("flex items-center gap-2", step >= 3 ? "text-dark" : "text-dark/20")}>
+              <span className={cn("w-8 h-8 rounded-full flex items-center justify-center font-bold", step >= 3 ? "bg-dark text-cream" : "bg-dark/10")}>3</span>
+              <span className="font-bold hidden sm:block">Confirmation</span>
+            </div>
+          </div>
+
+          {step < 3 ? (
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-12">
+              {/* Main Checkout Form */}
+              <div className="lg:col-span-2 space-y-8">
+                {step === 1 && (
+                  <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="premium-card p-8 bg-white">
+                    <h2 className="text-2xl font-heading font-bold text-dark mb-6 flex items-center gap-3">
+                      <MapPin className="text-red-primary" /> Delivery Details
+                    </h2>
+                    <form onSubmit={(e) => { e.preventDefault(); setStep(2); }}>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div className="space-y-2">
+                          <label className="text-xs font-bold uppercase tracking-widest text-dark/40">Full Name</label>
+                          <input required name="name" value={formData.name} onChange={handleInputChange} className="w-full px-4 py-3 rounded-xl bg-cream/30 border border-dark/5 focus:border-red-primary focus:outline-none" />
+                        </div>
+                        <div className="space-y-2">
+                          <label className="text-xs font-bold uppercase tracking-widest text-dark/40">Phone Number</label>
+                          <input required name="phone" value={formData.phone} onChange={handleInputChange} className="w-full px-4 py-3 rounded-xl bg-cream/30 border border-dark/5 focus:border-red-primary focus:outline-none" />
+                        </div>
+                        <div className="md:col-span-2 space-y-2">
+                          <label className="text-xs font-bold uppercase tracking-widest text-dark/40">Email Address</label>
+                          <input required name="email" type="email" value={formData.email} onChange={handleInputChange} className="w-full px-4 py-3 rounded-xl bg-cream/30 border border-dark/5 focus:border-red-primary focus:outline-none" />
+                        </div>
+                        <div className="md:col-span-2 space-y-2">
+                          <label className="text-xs font-bold uppercase tracking-widest text-dark/40">Delivery Address</label>
+                          <textarea required name="address" value={formData.address} onChange={handleInputChange} rows={3} className="w-full px-4 py-3 rounded-xl bg-cream/30 border border-dark/5 focus:border-red-primary focus:outline-none resize-none" />
+                        </div>
+                        <div className="space-y-2">
+                          <label className="text-xs font-bold uppercase tracking-widest text-dark/40">Pincode</label>
+                          <input required name="pincode" value={formData.pincode} onChange={handleInputChange} className="w-full px-4 py-3 rounded-xl bg-cream/30 border border-dark/5 focus:border-red-primary focus:outline-none" />
+                        </div>
+                        <div className="space-y-2">
+                          <label className="text-xs font-bold uppercase tracking-widest text-dark/40">City</label>
+                          <input name="city" value={formData.city} readOnly className="w-full px-4 py-3 rounded-xl bg-dark/5 border border-dark/5 text-dark/40 cursor-not-allowed" />
+                        </div>
+                      </div>
+                      <button type="submit" className="btn-primary w-full mt-8">Continue to Payment</button>
+                    </form>
+                  </motion.div>
+                )}
+
+                {step === 2 && (
+                  <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="premium-card p-8 bg-white">
+                    <h2 className="text-2xl font-heading font-bold text-dark mb-6 flex items-center gap-3">
+                      <CreditCard className="text-red-primary" /> Payment Method
+                    </h2>
+                    <div className="space-y-4">
+                      {/* Razorpay Option */}
+                      <div 
+                        onClick={() => setPaymentMethod("razorpay")}
+                        className={cn(
+                          "p-6 rounded-2xl border-2 flex items-center justify-between cursor-pointer transition-colors",
+                          paymentMethod === "razorpay" ? "border-dark bg-cream/20" : "border-dark/10 hover:border-dark/30 bg-transparent"
+                        )}
+                      >
+                        <div className="flex items-center gap-4">
+                          <div className="w-12 h-12 bg-white rounded-xl flex items-center justify-center p-1 border border-dark/5">
+                            <Image src="https://razorpay.com/assets/razorpay-glyph.svg" alt="Razorpay" width={32} height={32} />
+                          </div>
+                          <div>
+                            <p className="font-bold text-dark">Pay via Razorpay Secure</p>
+                            <p className="text-xs text-dark/60">UPI, Cards, Netbanking, Wallets</p>
+                          </div>
+                        </div>
+                        <div className={cn(
+                          "w-5 h-5 rounded-full flex items-center justify-center transition-colors border",
+                          paymentMethod === "razorpay" ? "bg-dark border-dark text-cream" : "border-dark/30"
+                        )}>
+                          {paymentMethod === "razorpay" && <div className="w-2 h-2 rounded-full bg-cream" />}
+                        </div>
+                      </div>
+
+                      {/* COD Option */}
+                      <div 
+                        onClick={() => setPaymentMethod("cod")}
+                        className={cn(
+                          "p-6 rounded-2xl border-2 flex items-center justify-between cursor-pointer transition-colors",
+                          paymentMethod === "cod" ? "border-dark bg-cream/20" : "border-dark/10 hover:border-dark/30 bg-transparent"
+                        )}
+                      >
+                        <div className="flex items-center gap-4">
+                          <div className="w-12 h-12 bg-green-50 rounded-xl flex items-center justify-center p-1 border border-dark/5 text-green-600">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="20" height="12" x="2" y="6" rx="2"/><circle cx="12" cy="12" r="2"/><path d="M6 12h.01M18 12h.01"/></svg>
+                          </div>
+                          <div>
+                            <p className="font-bold text-dark">Cash on Delivery (COD)</p>
+                            <p className="text-xs text-dark/60">Pay in cash upon delivery</p>
+                          </div>
+                        </div>
+                        <div className={cn(
+                          "w-5 h-5 rounded-full flex items-center justify-center transition-colors border",
+                          paymentMethod === "cod" ? "bg-dark border-dark text-cream" : "border-dark/30"
+                        )}>
+                          {paymentMethod === "cod" && <div className="w-2 h-2 rounded-full bg-cream" />}
+                        </div>
+                      </div>
+                      
+                      <p className="text-sm text-dark/40 text-center italic mt-6">
+                        {paymentMethod === "razorpay" 
+                          ? "You will be redirected to the secure Razorpay payment gateway to complete your transaction." 
+                          : "You will pay the delivery executive when your order arrives."}
+                      </p>
+                    </div>
+                    <div className="flex gap-4 mt-8">
+                      <button onClick={() => setStep(1)} className="px-8 py-3 rounded-full font-bold border border-dark/10 hover:bg-dark/5 transition-colors">Back</button>
+                      <button 
+                        onClick={handlePayment} 
+                        disabled={isProcessing}
+                        className="btn-primary flex-grow disabled:opacity-70 flex justify-center items-center"
+                      >
+                        {isProcessing ? "Processing..." : `Pay ₹${formatPrice(total)}`}
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+              </div>
+
+              {/* Order Summary Sidebar */}
+              <div className="lg:col-span-1">
+                <div className="premium-card p-6 bg-white sticky top-32">
+                  <h3 className="text-xl font-heading font-bold text-dark mb-6">Order Summary</h3>
+                  <div className="space-y-4 mb-6 max-h-64 overflow-y-auto pr-2 scrollbar-thin">
+                    {items.map((item) => (
+                      <div key={`${item.id}-${item.weight}-${item.eggType}`} className="flex justify-between gap-4">
+                        <div className="flex-grow">
+                          <p className="text-sm font-bold text-dark line-clamp-1">{item.name}</p>
+                          <p className="text-[10px] text-dark/40 uppercase font-medium">{item.quantity} x {item.weight} ({item.eggType})</p>
+                        </div>
+                        <span className="text-sm font-bold text-dark whitespace-nowrap">₹{formatPrice(item.price * item.quantity)}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="space-y-3 pt-6 border-t border-dark/5">
+                    <div className="flex justify-between text-sm text-dark/60">
+                      <span>Subtotal</span>
+                      <span>₹{formatPrice(subtotal)}</span>
+                    </div>
+                    <div className="flex justify-between text-sm text-dark/60">
+                      <span>Delivery Charge <span className="text-[10px]">(Nagpur, 7 km)</span></span>
+                      <span>₹{formatPrice(deliveryCharge)}</span>
+                    </div>
+                    <div className="flex justify-between text-lg font-bold text-dark pt-2 border-t border-dark/5">
+                      <span>Total</span>
+                      <span className="text-red-primary">₹{formatPrice(total)}</span>
+                    </div>
+                  </div>
+                  <div className="mt-6 p-4 bg-red-light/10 rounded-xl flex items-start gap-3">
+                    <Truck size={18} className="text-red-primary shrink-0 mt-0.5" />
+                    <p className="text-xs text-dark-muted leading-snug">
+                      Estimated delivery: <strong>{items[0]?.deliveryDate || "Soon"}</strong> during <strong>{items[0]?.deliverySlot || "standard hours"}</strong>
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : (
+            /* Order Confirmation Step */
+            <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} className="max-w-4xl mx-auto py-4">
+              <div className="bg-white border border-[#dcdcdc] font-sans">
+                {/* Header */}
+                <div className="bg-[#4A4A4A] text-white p-6">
+                  <h2 className="text-3xl font-bold tracking-wide">New Order: #{confirmedOrder?.orderId || orderId}</h2>
+                </div>
+                
+                <div className="p-8 space-y-6">
+                  <p className="text-[#4a4a4a] text-lg">
+                    You&apos;ve received the following order from {confirmedOrder?.customerName || formData.name}:
+                  </p>
+                  
+                  <p className="text-lg pb-2">
+                    <span className="text-[#4A4A4A] underline font-medium">[Order #{confirmedOrder?.orderId || orderId}]</span> <span className="font-bold text-[#333]">({confirmedOrder?.date || new Date().toLocaleDateString('en-US', { month: 'long', day: '2-digit', year: 'numeric' })})</span>
+                  </p>
+
+                  <div className="border border-[#dcdcdc] w-full text-sm sm:text-base">
+                    <table className="w-full text-left border-collapse">
+                      <thead>
+                        <tr className="bg-[#f4f4f4] border-b border-[#dcdcdc]">
+                          <th className="p-4 font-bold text-[#333] border-r border-[#dcdcdc] w-1/2">Product</th>
+                          <th className="p-4 font-bold text-[#333] border-r border-[#dcdcdc] w-1/6">Quantity</th>
+                          <th className="p-4 font-bold text-[#333] w-1/3">Price</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {confirmedOrder?.items?.map((item: any, index: number) => (
+                          <tr key={index} className="border-b border-[#dcdcdc]">
+                            <td className="p-4 border-r border-[#dcdcdc]">
+                              <p className="text-[#4A4A4A] mb-2">{item.name} {item.id ? `(#${item.id})` : ''}</p>
+                              {item.weight && <p className="text-sm mt-1"><span className="font-bold text-[#333]">Weight:</span> {item.weight}</p>}
+                              {item.eggType && <p className="text-sm"><span className="font-bold text-[#333]">Cake-type:</span> {item.eggType}</p>}
+                            </td>
+                            <td className="p-4 border-r border-[#dcdcdc] text-[#333]">{item.quantity}</td>
+                            <td className="p-4 text-[#333]">₹{formatPrice(item.price * item.quantity)} <span className="text-xs text-dark/60">(inc. tax)</span></td>
+                          </tr>
+                        ))}
+                        
+                        {/* Summary Rows */}
+                        <tr className="border-b border-[#dcdcdc] bg-[#fafafa]">
+                          <td colSpan={2} className="p-4 font-bold text-[#333] border-r border-[#dcdcdc]">Subtotal:</td>
+                          <td className="p-4 text-[#333]">₹{formatPrice(confirmedOrder?.subtotal || subtotal)} <span className="text-xs text-dark/60">(inc. tax)</span></td>
+                        </tr>
+                        <tr className="border-b border-[#dcdcdc] bg-[#fafafa]">
+                          <td colSpan={2} className="p-4 font-bold text-[#333] border-r border-[#dcdcdc]">Shipping:</td>
+                          <td className="p-4 text-[#333]">Delivery Charge (₹{formatPrice(deliveryCharge)})</td>
+                        </tr>
+                        <tr className="border-b border-[#dcdcdc] bg-[#fafafa]">
+                          <td colSpan={2} className="p-4 border-r border-[#dcdcdc]">
+                            <span className="font-bold text-[#333]">Delivery Address:</span> We deliver cakes in Nagpur between 2 to 9 pm
+                          </td>
+                          <td className="p-4 text-[#333]">{formData.address}, {formData.pincode}</td>
+                        </tr>
+                        <tr className="bg-[#fafafa]">
+                          <td colSpan={2} className="p-4 font-bold text-[#333] border-r border-[#dcdcdc]">Payment method:</td>
+                          <td className="p-4 text-[#333]">{confirmedOrder?.paymentMethod || "Credit Card/Debit Card/NetBanking"}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+              
+              <div className="flex flex-col sm:flex-row gap-4 justify-center mt-8">
+                <Link href="/profile/orders" className="btn-primary">Track Your Order</Link>
+                <Link href="/" className="btn-secondary">Back to Home</Link>
+              </div>
+            </motion.div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
